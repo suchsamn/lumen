@@ -1,6 +1,6 @@
 // ===== LÚMEN SERVICE WORKER =====
 // Muda este número em cada deploy para forçar actualização imediata
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4;
 const CACHE_NAME = 'lumen-v' + CACHE_VERSION;
 
 // Apenas assets estáticos que mudam raramente (ícones/fontes)
@@ -38,16 +38,20 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   const url = new URL(event.request.url);
 
-  // Firebase, Google APIs, Spotify — sempre vai à rede, sem cache
+  // Firebase, Google APIs, Spotify — NÃO interceptar de forma alguma.
+  // O Firestore usa WebChannel (long-polling) que quebra se o SW chamar fetch().
+  // Ao não chamar event.respondWith(), o browser trata a request directamente.
   if (
     url.hostname.includes('firebase') ||
+    url.hostname.includes('firestore') ||
     url.hostname.includes('googleapis.com') ||
     url.hostname.includes('spotify.com') ||
     url.hostname.includes('gstatic.com') ||
-    url.hostname.includes('firebaseapp.com')
+    url.hostname.includes('firebaseapp.com') ||
+    url.hostname.includes('firebasestorage') ||
+    url.hostname.includes('identitytoolkit')
   ) {
-    event.respondWith(fetch(event.request));
-    return;
+    return; // deixar o browser tratar sem SW
   }
 
   const isAppFile = APP_FILES.some(f => url.pathname.endsWith(f.replace('./', '/'))) ||
