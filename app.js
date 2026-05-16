@@ -72,21 +72,57 @@ function save() {
   _saveDebounceTimer = setTimeout(() => { _syncToFirestore(); }, 1500);
 }
 
+// Remove qualquer string base64 longa do state antes de enviar para a nuvem
+// (banners/fotos devem estar como URLs do Storage, não como base64)
+function _stripBase64FromState(s) {
+  function stripVal(v) {
+    if (typeof v === 'string' && v.startsWith('data:') && v.length > 500) return '__base64_removed__';
+    if (Array.isArray(v)) return v.map(stripVal);
+    if (v && typeof v === 'object') return _stripBase64FromObj(v);
+    return v;
+  }
+  return _stripBase64FromObj(s);
+}
+function _stripBase64FromObj(obj) {
+  const out = {};
+  for (const k in obj) out[k] = (function stripVal(v) {
+    if (typeof v === 'string' && v.startsWith('data:') && v.length > 500) return '__base64_removed__';
+    if (Array.isArray(v)) return v.map(stripVal);
+    if (v && typeof v === 'object') return _stripBase64FromObj(v);
+    return v;
+  })(obj[k]);
+  return out;
+}
+
 async function _syncToFirestore() {
   const db = window._firestoreDb;
   const uid_user = window._currentUid;
-  if (!db || !uid_user) return;
+  if (!db || !uid_user) {
+    console.warn('[Lúmen] _syncToFirestore: db=' + !!db + ' uid=' + uid_user);
+    return;
+  }
   _syncStart();
   try {
     const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
-    // Imagens de notas inline (base64) ainda são excluídas — ficam só no localStorage
-    // Tudo o resto (banners, profilePic, greetingMedia) já são URLs do Storage — seguro enviar
+    // Remover notas com imagens inline (base64) E limpar qualquer outro base64 solto no state
     const notesForCloud = (state.notes || []).map(n => ({ ...n, images: [] }));
-    const stateForCloud = { ...state, notes: notesForCloud };
-    await setDoc(doc(db, 'users', uid_user), { data: JSON.stringify(stateForCloud) });
+    const stateRaw = { ...state, notes: notesForCloud };
+    const stateForCloud = _stripBase64FromState(stateRaw);
+    const payload = JSON.stringify(stateForCloud);
+    const sizeKB = Math.round(payload.length / 1024);
+    console.log('[Lúmen] Firestore save — payload: ' + sizeKB + ' KB, uid: ' + uid_user);
+    if (payload.length > 900000) {
+      console.error('[Lúmen] Payload demasiado grande (' + sizeKB + ' KB) — abortando save para proteger quota');
+      toast('⚠ Dados demasiado grandes para a nuvem. Imagens já guardadas no Storage.');
+      _syncEnd();
+      return;
+    }
+    await setDoc(doc(db, 'users', uid_user), { data: payload });
+    console.log('[Lúmen] Firestore save OK (' + sizeKB + ' KB)');
     _syncEnd();
   } catch (e) {
-    console.warn('[Lúmen] Firestore save erro:', e);
+    console.error('[Lúmen] Firestore save ERRO:', e.code, e.message);
+    toast('⚠ Erro ao sincronizar: ' + (e.code || e.message));
     _syncEnd();
   }
 }
@@ -94,19 +130,29 @@ async function _syncToFirestore() {
 async function loadFromFirestore() {
   const db = window._firestoreDb;
   const uid_user = window._currentUid;
-  if (!db || !uid_user) return false;
+  if (!db || !uid_user) {
+    console.warn('[Lúmen] loadFromFirestore: db=' + !!db + ' uid=' + uid_user);
+    return false;
+  }
+  console.log('[Lúmen] loadFromFirestore a carregar para uid:', uid_user);
   try {
     const { doc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
     const snap = await getDoc(doc(db, 'users', uid_user));
     if (snap.exists()) {
-      const parsed = JSON.parse(snap.data().data);
+      const raw = snap.data().data;
+      console.log('[Lúmen] Firestore load OK — ' + Math.round(raw.length / 1024) + ' KB');
+      const parsed = JSON.parse(raw);
       state = { ...state, ...parsed };
       _sanitizeState();
       _recalcAccountBalances();
       localStorage.setItem('eco_v2', JSON.stringify(state));
       return true;
+    } else {
+      console.log('[Lúmen] Firestore: documento não existe ainda (utilizador novo)');
     }
-  } catch (e) { console.warn('[Lúmen] Firestore load erro:', e); }
+  } catch (e) {
+    console.error('[Lúmen] Firestore load ERRO:', e.code, e.message, e);
+  }
   return false;
 }
 
@@ -1810,6 +1856,7 @@ async function init() {
   // Se o Firebase já disparou antes deste código correr, _pendingFirebaseUid
   // tem o uid guardado — consumimo-lo imediatamente.
   window._onFirebaseReady = async (uid) => {
+    console.log('[Lúmen] _onFirebaseReady chamado com uid:', uid);
     try {
       const loaded = await loadFromFirestore();
       if (loaded) {
