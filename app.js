@@ -32,11 +32,11 @@ let state = {
     'menos ruído, mais clareza.',
     'a profundidade vem da concentração.',
   ],
-  currentTransType: null,   // FIX: null = nenhum selecionado por padrão
+  currentTransType: null,
   taskFilter: 'all',
   transFilter: 'all',
   calendarView: 'month',
-  calendarDate: null, // será inicializado no init
+  calendarDate: null,
 };
 
 // ===== PENDING NOTE IMAGES =====
@@ -63,6 +63,67 @@ function uid() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
+// ===== CLOUDINARY CONFIG =====
+const CLOUDINARY_CLOUD = 'dwlvpwmba';
+const CLOUDINARY_PRESET = 'lumenpreset';
+
+// ===== CLOUDINARY UPLOAD =====
+// Converte dataUrl para File/Blob e envia para o Cloudinary.
+// Devolve a URL pública ou null em caso de erro.
+async function _uploadToStorage(path, dataUrl) {
+  _syncStart();
+  try {
+    // Comprimir imagens antes do upload (exceto GIFs)
+    let uploadData = dataUrl;
+    if (!path.endsWith('.gif') && dataUrl.startsWith('data:')) {
+      uploadData = await _compressDataUrl(dataUrl, 1600, 900, 0.75);
+    }
+
+    // Converter dataUrl em Blob
+    const res = await fetch(uploadData);
+    const blob = await res.blob();
+
+    // Usar o path como public_id (sem extensão) para podermos sobrescrever
+    const publicId = `lumen/${window._currentUid || 'anon'}/${path.replace(/\.[^.]+$/, '')}`;
+
+    const formData = new FormData();
+    formData.append('file', blob);
+    formData.append('upload_preset', CLOUDINARY_PRESET);
+    formData.append('public_id', publicId);
+    // invalidate=true força o CDN a servir a versão nova imediatamente
+    formData.append('invalidate', 'true');
+
+    const uploadRes = await fetch(
+      `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD}/image/upload`,
+      { method: 'POST', body: formData }
+    );
+
+    if (!uploadRes.ok) {
+      const err = await uploadRes.json().catch(() => ({}));
+      console.warn('[Lúmen] Cloudinary erro:', err);
+      _syncEnd();
+      return null;
+    }
+
+    const data = await uploadRes.json();
+    _syncEnd();
+    // Usar sempre a URL segura (https)
+    return data.secure_url;
+  } catch (e) {
+    console.warn('[Lúmen] Cloudinary upload erro:', e);
+    _syncEnd();
+    return null;
+  }
+}
+
+// Cloudinary não precisa de delete explícito para este caso de uso,
+// mas mantemos a função para compatibilidade com o resto do código.
+async function _deleteFromStorage(path) {
+  // No Cloudinary unsigned, delete requer assinatura do servidor.
+  // As imagens antigas são simplesmente substituídas pelo mesmo public_id.
+  // Não fazemos nada aqui — sem erros, sem crash.
+}
+
 // ===== FIRESTORE SYNC =====
 let _saveDebounceTimer = null;
 
@@ -79,11 +140,9 @@ async function _syncToFirestore() {
   _syncStart();
   try {
     const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
-    // Imagens de notas inline (base64) ainda são excluídas — ficam só no localStorage
-    // Tudo o resto (banners, profilePic, greetingMedia) já são URLs do Storage — seguro enviar
-    const notesForCloud = (state.notes || []).map(n => ({ ...n, images: [] }));
-    const stateForCloud = { ...state, notes: notesForCloud };
-    await setDoc(doc(db, 'users', uid_user), { data: JSON.stringify(stateForCloud) });
+    // Notas com imagens: as imagens agora são URLs do Cloudinary (não base64),
+    // por isso são seguras para guardar no Firestore.
+    await setDoc(doc(db, 'users', uid_user), { data: JSON.stringify(state) });
     _syncEnd();
   } catch (e) {
     console.warn('[Lúmen] Firestore save erro:', e);
@@ -149,6 +208,7 @@ function load() {
     _recalcAccountBalances();
   }
 }
+
 function fmtEur(n) {
   return '€\u00a0' + Number(n || 0).toLocaleString('pt-PT', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -191,7 +251,7 @@ function _compressDataUrl(dataUrl, maxW, maxH, quality) {
     const img = new Image();
     img.onload = () => {
       let w = img.naturalWidth, h = img.naturalHeight;
-      const ratio = Math.min(maxW / w, maxH / h, 1); // nunca ampliar
+      const ratio = Math.min(maxW / w, maxH / h, 1);
       w = Math.round(w * ratio);
       h = Math.round(h * ratio);
       const canvas = document.createElement('canvas');
@@ -199,46 +259,10 @@ function _compressDataUrl(dataUrl, maxW, maxH, quality) {
       canvas.getContext('2d').drawImage(img, 0, 0, w, h);
       resolve(canvas.toDataURL('image/jpeg', quality));
     };
-    img.onerror = () => resolve(dataUrl); // fallback sem compressão
+    img.onerror = () => resolve(dataUrl);
     img.src = dataUrl;
   });
 }
-
-// ===== FIREBASE STORAGE UPLOAD =====
-async function _uploadToStorage(path, dataUrl) {
-  const storage = window._firebaseStorage;
-  const uid_user = window._currentUid;
-  if (!storage || !uid_user) return null;
-  _syncStart();
-  try {
-    // Comprimir JPEGs antes do upload (banners, profilePic, greetingMedia)
-    let uploadData = dataUrl;
-    if (!path.endsWith('.gif') && dataUrl.startsWith('data:')) {
-      uploadData = await _compressDataUrl(dataUrl, 1600, 900, 0.75);
-    }
-    const { ref, uploadString, getDownloadURL } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js');
-    const storageRef = ref(storage, `users/${uid_user}/${path}`);
-    const snapshot = await uploadString(storageRef, uploadData, 'data_url');
-    const url = await getDownloadURL(snapshot.ref);
-    _syncEnd();
-    return url;
-  } catch (e) {
-    console.warn('[Lúmen] Storage upload erro:', e);
-    _syncEnd();
-    return null;
-  }
-}
-
-async function _deleteFromStorage(path) {
-  const storage = window._firebaseStorage;
-  const uid_user = window._currentUid;
-  if (!storage || !uid_user) return;
-  try {
-    const { ref, deleteObject } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js');
-    await deleteObject(ref(storage, `users/${uid_user}/${path}`));
-  } catch (e) { /* ficheiro pode não existir */ }
-}
-
 
 function toggleBannerMenu(bannerId, btn) {
   const dropdown = document.getElementById('bmenu-' + bannerId);
@@ -291,7 +315,6 @@ function showPage(id) {
 function toggleSidebar() {
   const sidebar = document.getElementById('sidebar');
   sidebar.classList.toggle('collapsed');
-  // No desktop, a seta do header basta. No mobile, a lógica é gerida pelo openSidebarMobile/closeSidebarMobile.
 }
 
 // ===== MODALS =====
@@ -313,7 +336,6 @@ function updateGreeting() {
   const greetingImgEl = document.getElementById('greetingImg');
 
   if (state.settings.greetingMedia) {
-    // mostrar imagem/gif no lugar do texto
     if (greetingEl) greetingEl.style.display = 'none';
     if (greetingImgEl) {
       greetingImgEl.src = state.settings.greetingMedia;
@@ -337,33 +359,41 @@ function setTheme(theme, btn) {
   state.settings.theme = theme;
   save();
 }
+
 function setProfilePic(input) {
   const file = input.files[0]; if (!file) return;
   const r = new FileReader();
   r.onload = async e => {
     const dataUrl = e.target.result;
+    // Mostrar imediatamente (base64 local)
     state.settings.profilePic = dataUrl;
     const pic = document.getElementById('profilePic');
     if (pic) { pic.src = dataUrl; pic.style.display = 'block'; }
     save();
+    toast('A carregar foto de perfil... ⏳');
+    // Upload para Cloudinary e substituir pelo URL permanente
     const url = await _uploadToStorage('profilePic.jpg', dataUrl);
     if (url) {
       state.settings.profilePic = url;
       if (pic) pic.src = url;
       save();
+      toast('Foto de perfil sincronizada ✦');
+    } else {
+      toast('Foto aplicada (apenas local — verifique a ligação)');
     }
   };
   r.readAsDataURL(file);
 }
+
 function exportData() {
   const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a'); a.href = url; a.download = 'eco-backup.json'; a.click();
   URL.revokeObjectURL(url); toast('Dados exportados!');
 }
+
 function clearAll() {
   if (confirm('Tem a certeza? Esta ação apagará todos os seus dados locais e na nuvem.')) {
-    // Apagar do Firestore antes de sair
     const db = window._firestoreDb;
     const uid_user = window._currentUid;
     if (db && uid_user) {
@@ -405,12 +435,13 @@ function setGreetingMedia(input) {
       updateGreeting();
       toast('Imagem de saudação sincronizada ✦');
     } else {
-      toast('Imagem aplicada (apenas local — sem ligação à nuvem)');
+      toast('Imagem aplicada (apenas local — verifique a ligação)');
     }
   };
   r.readAsDataURL(file);
   input.value = '';
 }
+
 function removeGreetingMedia() {
   delete state.settings.greetingMedia;
   save();
@@ -434,13 +465,11 @@ function openImagePositioner(bannerId, input) {
     positioner.zoom = 100;
 
     if (isGif) {
-      // GIFs: aplicar visualmente de imediato com base64
       const banner = document.getElementById(bannerId);
       banner.style.backgroundImage = `url(${e.target.result})`;
       banner.style.backgroundSize = 'cover';
       banner.style.backgroundPosition = 'center';
       toast('A carregar GIF para a nuvem... ⏳');
-      // Upload para o Storage e guardar URL
       const url = await _uploadToStorage(`banners/${bannerId}.gif`, e.target.result);
       if (url) {
         state.settings['banner_' + bannerId] = url;
@@ -448,11 +477,10 @@ function openImagePositioner(bannerId, input) {
         save();
         toast('GIF sincronizado com a nuvem ✦');
       } else {
-        // Fallback: guardar base64 localmente apenas
         state.settings['banner_' + bannerId] = e.target.result;
         state.settings['bannerIsGif_' + bannerId] = true;
         save();
-        toast('GIF aplicado (apenas local — sem ligação à nuvem)');
+        toast('GIF aplicado (apenas local — verifique a ligação)');
       }
     } else {
       const img = document.getElementById('positionerImg');
@@ -530,11 +558,10 @@ async function applyBannerPosition() {
     save();
     toast('Imagem sincronizada com a nuvem ✦');
   } else {
-    // Fallback local
     state.settings['banner_' + positioner.bannerId] = dataUrl;
     state.settings['bannerIsGif_' + positioner.bannerId] = false;
     save();
-    toast('Imagem aplicada (apenas local — sem ligação à nuvem)');
+    toast('Imagem aplicada (apenas local — verifique a ligação)');
   }
 }
 
@@ -545,8 +572,6 @@ function removeBanner(bannerId) {
     banner.style.backgroundSize = '';
     banner.style.backgroundPosition = '';
   }
-  const isGif = state.settings['bannerIsGif_' + bannerId];
-  _deleteFromStorage(`banners/${bannerId}${isGif ? '.gif' : '.jpg'}`);
   delete state.settings['banner_' + bannerId];
   delete state.settings['bannerIsGif_' + bannerId];
   save();
@@ -622,7 +647,6 @@ function addTask() {
     done: false,
   };
   state.tasks.push(task);
-  // Se tem data, adicionar automaticamente ao calendário
   if (taskDate) {
     state.calendarEvents.push({
       id: uid(),
@@ -646,7 +670,6 @@ function toggleTask(id) {
 }
 function deleteTask(id) {
   state.tasks = state.tasks.filter(t => t.id !== id);
-  // Remove eventos do calendário associados
   state.calendarEvents = state.calendarEvents.filter(e => e.refId !== id);
   save(); renderTasks(); renderDashboard(); renderCalendar(); toast('Tarefa removida.');
 }
@@ -691,14 +714,12 @@ function setTransactionType(type) {
   document.getElementById('typeExpense').classList.toggle('active', type === 'expense');
 }
 
-// FIX: resetar seleção de tipo ao abrir modal de transação
 function openTransactionModal() {
   state.currentTransType = null;
   const incomeBtn = document.getElementById('typeIncome');
   const expenseBtn = document.getElementById('typeExpense');
   if (incomeBtn) incomeBtn.classList.remove('active');
   if (expenseBtn) expenseBtn.classList.remove('active');
-  // Limpar campos
   const titleEl = document.getElementById('transTitle');
   const amountEl = document.getElementById('transAmount');
   if (titleEl) titleEl.value = '';
@@ -841,74 +862,49 @@ function renderFinance() {
     if (catTotals[t.category] !== undefined) catTotals[t.category] += t.amount;
     else catTotals[t.category] = t.amount;
   });
-  const maxCat = Math.max(...Object.values(catTotals), 1);
 
   const catGrid = document.getElementById('categoriesGrid');
   if (catGrid) {
     catGrid.innerHTML = state.categories.map(c => `
-      <div class="category-card">
-        <div class="category-card-name">${c.icon} ${c.name}</div>
-        <div class="category-card-value">${fmtEur(catTotals[c.name] || 0)}</div>
-        <div class="category-card-bar"><div class="category-card-bar-fill" style="width:${((catTotals[c.name] || 0) / maxCat * 100).toFixed(1)}%"></div></div>
+      <div class="category-item">
+        <span class="category-item-icon">${c.icon}</span>
+        <span class="category-item-name">${c.name}</span>
+        <span class="category-item-val">${fmtEur(catTotals[c.name] || 0)}</span>
       </div>`).join('');
   }
 
-  renderPieChart(catTotals);
-  renderTransactionsList();
-  updateAccountSelect();
-  updateCategorySelect();
-}
-
-// ===== PIE CHART =====
-const PIE_COLORS = [
-  '#b8a9e8','#89c4a4','#d4889a','#d4b896','#7ec8e3',
-  '#f0c080','#a8d8a8','#e8a0b4','#98c4d8','#c8a8e8',
-  '#d4c080','#a0c8a0','#e8b8c8','#80b8d0',
-];
-function renderPieChart(catTotals) {
-  const canvas = document.getElementById('pieChart');
-  if (!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const w = canvas.width, h = canvas.height;
-  ctx.clearRect(0, 0, w, h);
-
-  const entries = Object.entries(catTotals).filter(([, v]) => v > 0);
+  // Pie chart
+  const entries = Object.entries(catTotals).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
   const total = entries.reduce((s, [, v]) => s + v, 0);
+  const PIE_COLORS = ['#b8a9e8','#89c4a4','#d4889a','#7ec8e3','#d4b896','#a8d8a8','#f4a7b9','#b0c4de'];
 
-  if (total === 0) {
-    ctx.fillStyle = 'rgba(255,255,255,0.08)';
-    ctx.beginPath(); ctx.arc(w / 2, h / 2, w / 2 - 8, 0, Math.PI * 2); ctx.fill();
-    ctx.fillStyle = 'rgba(255,255,255,0.25)';
-    ctx.font = '13px DM Sans'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-    ctx.fillText('Sem dados', w / 2, h / 2);
-    document.getElementById('pieLegend').innerHTML = '';
-    return;
-  }
-
-  let startAngle = -Math.PI / 2;
-  const cx = w / 2, cy = h / 2, r = w / 2 - 6, innerR = r * 0.52;
-
-  entries.forEach(([name, val], i) => {
-    const slice = (val / total) * Math.PI * 2;
+  const canvas = document.getElementById('pieChart');
+  if (canvas && entries.length > 0) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, 200, 200);
+    let start = -Math.PI / 2;
+    entries.forEach(([, val], i) => {
+      const slice = (val / total) * 2 * Math.PI;
+      ctx.beginPath();
+      ctx.moveTo(100, 100);
+      ctx.arc(100, 100, 90, start, start + slice);
+      ctx.closePath();
+      ctx.fillStyle = PIE_COLORS[i % PIE_COLORS.length];
+      ctx.fill();
+      start += slice;
+    });
     ctx.beginPath();
-    ctx.moveTo(cx, cy);
-    ctx.arc(cx, cy, r, startAngle, startAngle + slice);
-    ctx.closePath();
-    ctx.fillStyle = PIE_COLORS[i % PIE_COLORS.length];
+    ctx.arc(100, 100, 50, 0, 2 * Math.PI);
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--surface') || '#1a1a26';
     ctx.fill();
-    ctx.strokeStyle = 'rgba(0,0,0,0.25)';
-    ctx.lineWidth = 1.5;
-    ctx.stroke();
-    startAngle += slice;
-  });
-
-  ctx.beginPath(); ctx.arc(cx, cy, innerR, 0, Math.PI * 2);
-  ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--surface').trim() || '#1a1a26';
-  ctx.fill();
-
-  ctx.fillStyle = 'rgba(255,255,255,0.7)';
-  ctx.font = 'bold 11px DM Sans'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(fmtEur(total), cx, cy);
+  } else if (canvas) {
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, 200, 200);
+    ctx.beginPath();
+    ctx.arc(100, 100, 90, 0, 2 * Math.PI);
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--border') || 'rgba(255,255,255,0.07)';
+    ctx.fill();
+  }
 
   const legend = document.getElementById('pieLegend');
   if (legend) {
@@ -919,6 +915,7 @@ function renderPieChart(catTotals) {
         <span class="pie-legend-val">${fmtEur(val)}</span>
       </div>`).join('');
   }
+  renderTransactionsList();
 }
 
 function renderTransactionsList() {
@@ -960,7 +957,6 @@ function addGoal() {
     completed: false,
   };
   state.goals.push(goal);
-  // Adicionar ao calendário se tiver data de conclusão
   if (deadline) {
     state.calendarEvents.push({
       id: uid(),
@@ -1028,7 +1024,7 @@ function handleNoteImages(input) {
   files.forEach(file => {
     const r = new FileReader();
     r.onload = e => {
-      pendingNoteImages.push(e.target.result);
+      pendingNoteImages.push({ dataUrl: e.target.result, uploaded: false });
       renderNoteImagesPreview();
     };
     r.readAsDataURL(file);
@@ -1039,9 +1035,9 @@ function handleNoteImages(input) {
 function renderNoteImagesPreview() {
   const preview = document.getElementById('noteImagesPreview');
   if (!preview) return;
-  preview.innerHTML = pendingNoteImages.map((src, i) => `
+  preview.innerHTML = pendingNoteImages.map((img, i) => `
     <div class="note-img-thumb">
-      <img src="${src}" alt="" />
+      <img src="${img.dataUrl || img}" alt="" />
       <button class="note-img-thumb-del" onclick="removePendingImage(${i})">✕</button>
     </div>`).join('');
 }
@@ -1051,24 +1047,40 @@ function removePendingImage(i) {
   renderNoteImagesPreview();
 }
 
-function addNote() {
+async function addNote() {
   const content = document.getElementById('noteContent').value.trim();
   if (!content && pendingNoteImages.length === 0) { toast('Escreva algo ou adicione uma imagem!'); return; }
+
+  toast('A guardar nota... ⏳');
+
+  // Upload das imagens para o Cloudinary antes de guardar a nota
+  const noteId = uid();
+  const uploadedImages = [];
+  for (let i = 0; i < pendingNoteImages.length; i++) {
+    const imgData = pendingNoteImages[i].dataUrl || pendingNoteImages[i];
+    const isGif = imgData.startsWith('data:image/gif');
+    const ext = isGif ? 'gif' : 'jpg';
+    const url = await _uploadToStorage(`notes/${noteId}/img_${i}.${ext}`, imgData);
+    // Se upload falhou, guardar base64 local como fallback
+    uploadedImages.push(url || imgData);
+  }
+
   state.notes.unshift({
-    id: uid(),
+    id: noteId,
     title: document.getElementById('noteTitle').value.trim() || 'Nota sem título',
     content,
     mood: state.currentMood,
-    images: [...pendingNoteImages],
+    images: uploadedImages,
     date: new Date().toISOString(),
   });
+
   save(); closeModal('noteModal');
   document.getElementById('noteTitle').value = '';
   document.getElementById('noteContent').value = '';
   pendingNoteImages = [];
   renderNoteImagesPreview();
   renderNotes(); renderDashboard();
-  toast('Nota salva!');
+  toast('Nota salva ✦');
 }
 
 function deleteNote(id) {
@@ -1174,20 +1186,16 @@ function renderCalendar() {
   const year = calendarCurrentDate.getFullYear();
   const month = calendarCurrentDate.getMonth();
 
-  // Header
   const monthNames = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
   const monthLabel = document.getElementById('calMonthLabel');
   if (monthLabel) monthLabel.textContent = `${monthNames[month]} ${year}`;
 
-  const firstDay = new Date(year, month, 1).getDay(); // 0=dom
+  const firstDay = new Date(year, month, 1).getDay();
   const daysInMonth = new Date(year, month + 1, 0).getDate();
-  const startOffset = (firstDay + 6) % 7; // segunda=0
+  const startOffset = (firstDay + 6) % 7;
 
-  // Coletar eventos do mês
   const monthStr = `${year}-${String(month + 1).padStart(2, '0')}`;
   const monthEvents = state.calendarEvents.filter(e => e.date && e.date.startsWith(monthStr));
-
-  // Tarefas do mês (que não foram adicionadas como evento)
   const taskEvents = state.tasks.filter(t => t.date && t.date.startsWith(monthStr) && !state.calendarEvents.find(e => e.refId === t.id));
 
   let html = '';
@@ -1266,7 +1274,6 @@ function deleteCalendarEvent(id) {
   state.calendarEvents = state.calendarEvents.filter(e => e.id !== id);
   save();
   renderCalendar();
-  // Re-render modal
   const modal = document.getElementById('calendarDayModal');
   if (modal && modal.classList.contains('open')) {
     const dateStr = document.getElementById('calDayDate').value;
@@ -1334,14 +1341,8 @@ function submitFeedback() {
   const text = document.getElementById('feedbackText').value.trim();
   const type = document.getElementById('feedbackType').value;
   if (!text) { toast('Escreva seu feedback!'); return; }
-
-  // Salvar feedback localmente
   if (!state.feedbacks) state.feedbacks = [];
-  state.feedbacks.push({
-    id: uid(),
-    type, text,
-    date: new Date().toISOString(),
-  });
+  state.feedbacks.push({ id: uid(), type, text, date: new Date().toISOString() });
   save();
   closeModal('feedbackModal');
   toast('Obrigado pelo feedback! ✦');
@@ -1401,9 +1402,7 @@ function renderDashboard() {
 }
 
 function renderAll() {
-  // Sempre actualiza o dashboard (está visível no overview)
   renderDashboard();
-  // Só renderiza o módulo da página activa para evitar lag
   const activePage = document.querySelector('.page.active');
   if (!activePage) return;
   const id = activePage.id.replace('page-', '');
@@ -1498,20 +1497,16 @@ function rotateFocusQuote() {
     i = (i + 1) % quotes.length;
     el.style.opacity = '0';
     setTimeout(() => { el.textContent = quotes[i]; el.style.opacity = '1'; }, 400);
-  }, 8000);
+  }, 6000);
 }
 function spawnFocusParticles() {
   const container = document.getElementById('focusParticles');
   if (!container) return;
   container.innerHTML = '';
-  for (let i = 0; i < 25; i++) {
+  for (let i = 0; i < 18; i++) {
     const p = document.createElement('div');
     p.className = 'focus-particle';
-    const left = Math.random() * 100;
-    const drift = (Math.random() - 0.5) * 120;
-    const duration = 8 + Math.random() * 12;
-    const delay = Math.random() * 8;
-    p.style.cssText = `left:${left}%;bottom:0;--drift:${drift}px;animation-duration:${duration}s;animation-delay:${delay}s;`;
+    p.style.cssText = `left:${Math.random()*100}%;top:${Math.random()*100}%;animation-delay:${Math.random()*4}s;animation-duration:${3+Math.random()*4}s;`;
     container.appendChild(p);
   }
 }
@@ -1544,7 +1539,6 @@ function getGardenStage(streak) {
 
 function getPlantEmoji(habit, streak) {
   const stage = getGardenStage(streak);
-  // Use habit id as a stable seed for emoji selection
   const seed = habit.id.charCodeAt(0) + habit.id.charCodeAt(1);
   return stage.emojis[seed % stage.emojis.length];
 }
@@ -1596,7 +1590,7 @@ function waterPlant(habitId) {
   const t = today();
   const current = h.counts[t] || 0;
   if (current >= h.goal) { toast('Já regaste esta planta hoje! 🌿'); return; }
-  h.counts[t] = h.goal; // Mark as fully done
+  h.counts[t] = h.goal;
   save();
   renderGarden();
   renderHabits();
@@ -1791,14 +1785,10 @@ function loadUserProfile() {
 async function init() {
   if (!checkAuth()) return;
 
-  // Mostrar ecrã de loading enquanto aguarda dados da nuvem
   _showAppLoading(true);
-
-  // Carregar localStorage como base inicial (dados offline/fallback)
   load();
   _applySettings();
 
-  // Aplicar tema imediatamente para evitar flash
   if (state.settings.theme) {
     document.documentElement.setAttribute('data-theme', state.settings.theme);
   }
@@ -1806,14 +1796,10 @@ async function init() {
   document.querySelectorAll('input[type="date"]').forEach(el => { if (!el.value) el.value = today(); });
   setInterval(updateGreeting, 60000);
 
-  // Registar callback que o Firebase chama quando o auth estiver pronto.
-  // Se o Firebase já disparou antes deste código correr, _pendingFirebaseUid
-  // tem o uid guardado — consumimo-lo imediatamente.
   window._onFirebaseReady = async (uid) => {
     try {
       const loaded = await loadFromFirestore();
       if (loaded) {
-        // Dados da nuvem carregados — renderizar tudo com dados actualizados
         _applySettings(); restoreBanners();
         updateAccountSelect(); updateCategorySelect();
         loadUserProfile(); restoreSpotifyWidget();
@@ -1821,17 +1807,14 @@ async function init() {
         updateGreeting();
         _showAppLoading(false);
       } else {
-        // Utilizador novo ou sem dados na nuvem — usar localStorage
         _bootFromLocal();
       }
     } catch(e) {
       console.warn('[Lúmen] sync erro:', e);
-      // Falha de rede — usar dados locais
       _bootFromLocal();
     }
   };
 
-  // Timeout de segurança: se o Firebase demorar mais de 15s, usa dados locais
   let _firebaseResolved = false;
   const _origReady = window._onFirebaseReady;
   window._onFirebaseReady = async (uid) => {
@@ -1847,12 +1830,10 @@ async function init() {
     }
   }, 15000);
 
-  // Consumir uid pendente: o Firebase disparou antes do app.js estar pronto
   if (typeof window._pendingFirebaseUid === 'string') {
     window._onFirebaseReady(window._pendingFirebaseUid);
     window._pendingFirebaseUid = undefined;
   } else if (window._currentUid && window._firestoreDb) {
-    // Fallback: uid já disponível por outra via
     window._onFirebaseReady(window._currentUid);
   }
 }
