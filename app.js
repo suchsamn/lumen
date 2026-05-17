@@ -65,20 +65,67 @@ function uid() {
 
 // ===== FIRESTORE SYNC =====
 let _saveDebounceTimer = null;
+let _cloudUnsubscribe = null;
+let _isApplyingRemoteState = false;
+let _lastCloudDataString = null;
+
+function _getLocalStateKey() {
+  return window._currentUid ? `eco_v2_${window._currentUid}` : 'eco_v2';
+}
+
+function _writeLocalState() {
+  const serialized = JSON.stringify(state);
+  localStorage.setItem(_getLocalStateKey(), serialized);
+  if (_getLocalStateKey() !== 'eco_v2') localStorage.setItem('eco_v2', serialized);
+}
+
+function _readLocalState() {
+  const userKey = _getLocalStateKey();
+  return localStorage.getItem(userKey) || localStorage.getItem('eco_v2');
+}
+
+function _serializeStateForCloud() {
+  const notesForCloud = (state.notes || []).map(n => ({
+    ...n,
+    images: (n.images || []).filter(src => typeof src === 'string' && !src.startsWith('data:')),
+  }));
+  return JSON.stringify({ ...state, notes: notesForCloud });
+}
+
+function _applyCloudState(parsed) {
+  _isApplyingRemoteState = true;
+  try {
+    state = { ...state, ...parsed };
+    _sanitizeState();
+    _recalcAccountBalances();
+    _writeLocalState();
+  } finally {
+    _isApplyingRemoteState = false;
+  }
+}
+
+function _renderSyncedState() {
+  _applySettings();
+  restoreBanners();
+  updateAccountSelect();
+  updateCategorySelect();
+  loadUserProfile();
+  restoreSpotifyWidget();
+  renderAll();
+  updateGreeting();
+}
 
 function save() {
-  localStorage.setItem('eco_v2', JSON.stringify(state));
+  _writeLocalState();
+  if (_isApplyingRemoteState) return;
   if (_saveDebounceTimer) clearTimeout(_saveDebounceTimer);
-  _saveDebounceTimer = setTimeout(() => { _syncToFirestore(); }, 1500);
+  _saveDebounceTimer = setTimeout(() => { _syncToFirestore(); }, 800);
 }
 
 async function _syncToFirestore() {
   const db = window._firestoreDb;
   const uid_user = window._currentUid;
   if (!db || !uid_user) return;
-  // ⚠ Não escrever na nuvem antes de termos carregado o estado da nuvem,
-  // senão um estado local vazio (sessão nova / outro dispositivo) apaga
-  // tudo o que já lá estava.
   if (!window._cloudSyncReady) {
     console.log('[Lúmen] sync adiado — ainda não carreguei dados da nuvem');
     return;
@@ -86,13 +133,12 @@ async function _syncToFirestore() {
   _syncStart();
   try {
     const { doc, setDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
-    // Filtrar quaisquer imagens base64 residuais (legacy) — só sincronizamos URLs do Storage.
-    const notesForCloud = (state.notes || []).map(n => ({
-      ...n,
-      images: (n.images || []).filter(src => typeof src === 'string' && !src.startsWith('data:')),
-    }));
-    const stateForCloud = { ...state, notes: notesForCloud };
-    await setDoc(doc(db, 'users', uid_user), { data: JSON.stringify(stateForCloud) });
+    const serialized = _serializeStateForCloud();
+    await setDoc(doc(db, 'users', uid_user), {
+      data: serialized,
+      updatedAt: Date.now(),
+    }, { merge: true });
+    _lastCloudDataString = serialized;
     _syncEnd();
   } catch (e) {
     console.warn('[Lúmen] Firestore save erro:', e);
@@ -108,22 +154,50 @@ async function loadFromFirestore() {
     const { doc, getDoc } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
     const snap = await getDoc(doc(db, 'users', uid_user));
     if (snap.exists()) {
-      const parsed = JSON.parse(snap.data().data);
-      state = { ...state, ...parsed };
-      _sanitizeState();
-      _recalcAccountBalances();
-      localStorage.setItem('eco_v2', JSON.stringify(state));
+      const raw = snap.data().data;
+      const parsed = JSON.parse(raw);
+      _applyCloudState(parsed);
+      _lastCloudDataString = raw;
       window._cloudSyncReady = true;
       return true;
     }
-    // Documento ainda não existe — utilizador novo. Liberamos escrita para a nuvem.
     window._cloudSyncReady = true;
   } catch (e) {
     console.warn('[Lúmen] Firestore load erro:', e);
-    // NÃO ativamos _cloudSyncReady em caso de erro de rede — assim
-    // não apagamos a nuvem com estado local incompleto.
   }
   return false;
+}
+
+async function _subscribeToFirestore() {
+  const db = window._firestoreDb;
+  const uid_user = window._currentUid;
+  if (!db || !uid_user) return;
+  if (typeof _cloudUnsubscribe === 'function') _cloudUnsubscribe();
+  const { doc, onSnapshot } = await import('https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js');
+  _cloudUnsubscribe = onSnapshot(doc(db, 'users', uid_user), (snap) => {
+    if (!snap.exists()) return;
+    const raw = snap.data()?.data;
+    if (!raw || raw === _lastCloudDataString) return;
+    try {
+      const parsed = JSON.parse(raw);
+      _lastCloudDataString = raw;
+      _applyCloudState(parsed);
+      _renderSyncedState();
+      _showAppLoading(false);
+      console.log('[Lúmen] dados atualizados da nuvem');
+    } catch (e) {
+      console.warn('[Lúmen] snapshot inválido:', e);
+    }
+  }, (e) => {
+    console.warn('[Lúmen] listener Firestore erro:', e);
+  });
+}
+
+async function refreshFromCloud() {
+  if (!window._firestoreDb || !window._currentUid) return false;
+  const loaded = await loadFromFirestore();
+  if (loaded) _renderSyncedState();
+  return loaded;
 }
 
 function _sanitizeState() {
@@ -157,7 +231,7 @@ function _sanitizeState() {
 }
 
 function load() {
-  const d = localStorage.getItem('eco_v2');
+  const d = _readLocalState();
   if (d) {
     const parsed = JSON.parse(d);
     state = { ...state, ...parsed };
@@ -1852,14 +1926,12 @@ function loadUserProfile() {
 async function init() {
   if (!checkAuth()) return;
 
-  // Mostrar ecrã de loading enquanto aguarda dados da nuvem
+  window._cloudSyncReady = false;
   _showAppLoading(true);
 
-  // Carregar localStorage como base inicial (dados offline/fallback)
   load();
   _applySettings();
 
-  // Aplicar tema imediatamente para evitar flash
   if (state.settings.theme) {
     document.documentElement.setAttribute('data-theme', state.settings.theme);
   }
@@ -1867,32 +1939,26 @@ async function init() {
   document.querySelectorAll('input[type="date"]').forEach(el => { if (!el.value) el.value = today(); });
   setInterval(updateGreeting, 60000);
 
-  // Registar callback que o Firebase chama quando o auth estiver pronto.
-  // Se o Firebase já disparou antes deste código correr, _pendingFirebaseUid
-  // tem o uid guardado — consumimo-lo imediatamente.
   window._onFirebaseReady = async (uid) => {
+    window._currentUid = uid;
     try {
       const loaded = await loadFromFirestore();
+      await _subscribeToFirestore();
       if (loaded) {
-        // Dados da nuvem carregados — renderizar tudo com dados actualizados
-        _applySettings(); restoreBanners();
-        updateAccountSelect(); updateCategorySelect();
-        loadUserProfile(); restoreSpotifyWidget();
-        renderAll();
-        updateGreeting();
+        _renderSyncedState();
         _showAppLoading(false);
       } else {
-        // Utilizador novo ou sem dados na nuvem — usar localStorage
         _bootFromLocal();
+        if ((state.notes && state.notes.length) || (state.tasks && state.tasks.length) || (state.transactions && state.transactions.length)) {
+          save();
+        }
       }
     } catch(e) {
       console.warn('[Lúmen] sync erro:', e);
-      // Falha de rede — usar dados locais
       _bootFromLocal();
     }
   };
 
-  // Timeout de segurança: se o Firebase demorar mais de 15s, usa dados locais
   let _firebaseResolved = false;
   const _origReady = window._onFirebaseReady;
   window._onFirebaseReady = async (uid) => {
@@ -1908,12 +1974,15 @@ async function init() {
     }
   }, 15000);
 
-  // Consumir uid pendente: o Firebase disparou antes do app.js estar pronto
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') refreshFromCloud();
+  });
+  window.addEventListener('focus', () => { refreshFromCloud(); });
+
   if (typeof window._pendingFirebaseUid === 'string') {
     window._onFirebaseReady(window._pendingFirebaseUid);
     window._pendingFirebaseUid = undefined;
   } else if (window._currentUid && window._firestoreDb) {
-    // Fallback: uid já disponível por outra via
     window._onFirebaseReady(window._currentUid);
   }
 }
